@@ -29,6 +29,116 @@ class GISParser:
         self.page: Optional[Page] = None
         self.playwright = None
         
+        # Добавляем хранилище для отслеживания уникальных компаний
+        self.processed_companies = set()  # Для быстрой проверки
+        self.company_details = {}  # Для хранения детальной информации
+        
+    def normalize_company_name(self, name: str) -> str:
+        """Нормализация названия компании для сравнения"""
+        if not name or name == 'Не указано':
+            return ''
+            
+        # Приводим к нижнему регистру
+        normalized = name.lower().strip()
+        
+        # Убираем лишние пробелы и символы
+        normalized = re.sub(r'\s+', ' ', normalized)
+        normalized = re.sub(r'[^\w\s]', '', normalized, flags=re.UNICODE)
+        
+        # Убираем типичные суффиксы филиалов
+        suffixes_to_remove = [
+            r'\s*филиал\s*\d*',
+            r'\s*отделение\s*\d*', 
+            r'\s*магазин\s*\d*',
+            r'\s*точка\s*\d*',
+            r'\s*№\s*\d+',
+            r'\s*\d+\s*$',  # Цифры в конце
+            r'\s*mall\s*',
+            r'\s*тц\s*',
+            r'\s*тдц\s*',
+            r'\s*центр\s*',
+            r'\s*фудкорт\s*',
+            r'\s*торговый\s*центр\s*',
+        ]
+        
+        for suffix in suffixes_to_remove:
+            normalized = re.sub(suffix, '', normalized, flags=re.IGNORECASE)
+        
+        # Убираем названия торговых центров в скобках или после запятой
+        normalized = re.sub(r'\([^)]*\)', '', normalized)  # Убираем все в скобках
+        normalized = re.sub(r',.*$', '', normalized)  # Убираем все после запятой
+        
+        # Финальная очистка
+        normalized = normalized.strip()
+        
+        return normalized
+    
+    def is_company_already_processed(self, name: str, address: str = None) -> bool:
+        """Проверка, была ли компания уже обработана"""
+        normalized_name = self.normalize_company_name(name)
+        
+        if not normalized_name:
+            return False
+            
+        # Простая проверка по названию
+        if normalized_name in self.processed_companies:
+            logger.info(f"🔄 Компания '{name}' уже обработана (дубликат)")
+            return True
+            
+        # Дополнительная проверка по похожим названиям
+        for existing_name in self.processed_companies:
+            # Проверяем схожесть названий (например, если одно содержится в другом)
+            if len(normalized_name) > 3 and len(existing_name) > 3:
+                if normalized_name in existing_name or existing_name in normalized_name:
+                    # Дополнительно проверяем адрес если есть
+                    if address and existing_name in self.company_details:
+                        existing_address = self.company_details[existing_name].get('address', '')
+                        if existing_address and address:
+                            # Если адреса разные, возможно это разные компании
+                            if not self.addresses_similar(address, existing_address):
+                                continue
+                    
+                    logger.info(f"🔄 Найдена похожая компания: '{name}' ≈ '{existing_name}' (пропускаем)")
+                    return True
+        
+        return False
+    
+    def addresses_similar(self, addr1: str, addr2: str) -> bool:
+        """Проверка схожести адресов"""
+        if not addr1 or not addr2:
+            return False
+            
+        # Нормализуем адреса
+        addr1_norm = re.sub(r'[^\w\s]', ' ', addr1.lower())
+        addr2_norm = re.sub(r'[^\w\s]', ' ', addr2.lower())
+        
+        # Убираем номера домов/квартир для сравнения района
+        addr1_base = re.sub(r'\d+', '', addr1_norm).strip()
+        addr2_base = re.sub(r'\d+', '', addr2_norm).strip()
+        
+        # Если базовые части адресов совпадают более чем на 70%
+        common_words = set(addr1_base.split()) & set(addr2_base.split())
+        total_words = set(addr1_base.split()) | set(addr2_base.split())
+        
+        if total_words and len(common_words) / len(total_words) > 0.7:
+            return True
+            
+        return False
+    
+    def add_company_to_processed(self, name: str, business_info: Dict):
+        """Добавление компании в список обработанных"""
+        normalized_name = self.normalize_company_name(name)
+        if normalized_name:
+            self.processed_companies.add(normalized_name)
+            self.company_details[normalized_name] = {
+                'original_name': name,
+                'address': business_info.get('Адрес', ''),
+                'category': business_info.get('Категория', ''),
+                'phone': business_info.get('Телефон', ''),
+                'website': business_info.get('Сайт', '')
+            }
+            logger.debug(f"✅ Добавлена в обработанные: '{normalized_name}'")
+        
     async def setup_browser(self):
         """Настройка и запуск браузера"""
         self.playwright = await async_playwright().start()
@@ -366,7 +476,7 @@ class GISParser:
             return False
             
     async def extract_business_info(self, url: str, category: str) -> Optional[Dict]:
-        """Улучшенное извлечение информации с ожиданием динамического контента"""
+        """Улучшенное извлечение информации с проверкой дубликатов"""
         try:
             logger.info(f"Переходим на страницу: {url}")
             
@@ -376,14 +486,8 @@ class GISParser:
             # Ждем загрузки динамического контента
             await self.wait_for_dynamic_content()
             
-            # Извлекаем информацию
+            # Сначала извлекаем название для проверки дубликатов
             name = None
-            address = None
-            phone = None
-            website = None
-            whatsapp = None
-            instagram = None
-            
             try:
                 name = await self.extract_text_by_selectors([
                     'h1', 'h2', '[class*="title"]', '[class*="name"]', '[class*="header"]'
@@ -391,10 +495,27 @@ class GISParser:
             except Exception as e:
                 logger.debug(f"Ошибка при извлечении названия: {e}")
             
+            # Проверяем, не обрабатывали ли мы уже эту компанию
+            if name and self.is_company_already_processed(name):
+                logger.info(f"⏭️ Пропускаем дубликат: {name}")
+                return None
+            
+            # Если компания новая, продолжаем извлечение остальной информации
+            address = None
+            phone = None
+            website = None
+            whatsapp = None
+            instagram = None
+            
             try:
                 address = await self.extract_address()
             except Exception as e:
                 logger.debug(f"Ошибка при извлечении адреса: {e}")
+            
+            # Дополнительная проверка по адресу (если название слишком общее)
+            if name and address and self.is_company_already_processed(name, address):
+                logger.info(f"⏭️ Пропускаем дубликат по адресу: {name} - {address}")
+                return None
             
             try:
                 phone = await self.extract_phone()
@@ -402,7 +523,7 @@ class GISParser:
                 logger.debug(f"Ошибка при извлечении телефона: {e}")
             
             try:
-                website = await self.extract_website()  # Используем улучшенную версию
+                website = await self.extract_website()  # Используем исправленную версию
             except Exception as e:
                 logger.debug(f"Ошибка при извлечении сайта: {e}")
             
@@ -427,13 +548,17 @@ class GISParser:
                 'Есть сайт': 'Да' if website and website != 'Не указано' else 'Нет'
             }
             
-            logger.info(f"Собрана информация: {result['Название']}, {result['Адрес']}, {result['Телефон']}")
+            # Добавляем компанию в список обработанных
+            if name:
+                self.add_company_to_processed(name, result)
+            
+            logger.info(f"✅ Собрана информация: {result['Название']}, {result['Адрес']}, {result['Телефон']}")
             if website and website != 'Не указано':
-                logger.info(f"Сайт: {result['Сайт']}")
+                logger.info(f"🌐 Сайт: {result['Сайт']}")
             if whatsapp and whatsapp != 'Не указано':
-                logger.info(f"WhatsApp: {result['WhatsApp']}")
+                logger.info(f"📱 WhatsApp: {result['WhatsApp']}")
             if instagram and instagram != 'Не указано':
-                logger.info(f"Instagram: {result['Instagram']}")
+                logger.info(f"📸 Instagram: {result['Instagram']}")
             
             return result
             
@@ -572,52 +697,63 @@ class GISParser:
             logger.debug(f"Таймаут при ожидании динамического контента: {e}")
 
     async def decode_2gis_website_link(self, link: str) -> Optional[str]:
-        """Простое декодирование 2ГИС ссылок"""
+        """Улучшенное декодирование 2ГИС ссылок для сайтов"""
         try:
             import base64
+            import urllib.parse
             
             if 'link.2gis.com' not in link:
                 return None
                 
             logger.debug(f"Декодируем 2ГИС ссылку: {link}")
             
-            # Извлекаем base64 часть
+            # Извлекаем закодированную часть
             parts = link.split('/')
             if len(parts) < 2:
                 return None
                 
             encoded_part = parts[-1]
             
-            # Удаляем query параметры
+            # Убираем query параметры
             if '?' in encoded_part:
                 encoded_part = encoded_part.split('?')[0]
             if '#' in encoded_part:
                 encoded_part = encoded_part.split('#')[0]
                 
             try:
-                # Пробуем декодировать с разными padding
+                # Пробуем декодировать с разными вариантами padding
                 for padding in ['', '=', '==', '===']:
                     try:
                         padded_data = encoded_part + padding
                         decoded_bytes = base64.b64decode(padded_data)
                         decoded_string = decoded_bytes.decode('utf-8')
                         
-                        # Ищем только полные домены
-                        domain_patterns = [
-                            r'\b([a-zA-Z0-9][-a-zA-Z0-9]*\.(?:kz|com|ru|org|net))\b'
+                        logger.debug(f"Декодированная строка: {decoded_string[:200]}...")
+                        
+                        # Ищем URL в декодированной строке
+                        url_patterns = [
+                            r'https?://([a-zA-Z0-9][-a-zA-Z0-9]*\.(?:kz|com|ru|org|net|biz|cafe|coffee)(?:/[^\s]*)?)',
+                            r'http://([a-zA-Z0-9][-a-zA-Z0-9]*\.(?:kz|com|ru|org|net|biz|cafe|coffee)(?:/[^\s]*)?)',
+                            r'([a-zA-Z0-9][-a-zA-Z0-9]*\.(?:kz|com|ru|org|net|biz|cafe|coffee)(?:/[^\s]*)?)'
                         ]
                         
-                        for pattern in domain_patterns:
+                        for pattern in url_patterns:
                             matches = re.findall(pattern, decoded_string, re.IGNORECASE)
-                            for domain in matches:
+                            for match in matches:
+                                domain = match if isinstance(match, str) else match[0]
+                                
                                 # Исключаем служебные домены
                                 if not any(bad in domain.lower() for bad in ['2gis', 'sberbank', 'yandex', 'google']):
                                     if len(domain) > 6:
-                                        result = f"https://{domain}"
+                                        # Проверяем, есть ли уже протокол
+                                        if domain.startswith('http'):
+                                            result = domain
+                                        else:
+                                            result = f"https://{domain}"
                                         logger.info(f"Декодирован сайт: {result}")
                                         return result
                         
-                        break
+                        break  # Если декодирование прошло успешно, выходим
                     except:
                         continue
                         
@@ -631,94 +767,166 @@ class GISParser:
             return None
 
     async def extract_website(self) -> Optional[str]:
-        """Простое извлечение сайта только по классу _49kxlr"""
+        """Исправленное извлечение сайта по SVG иконке глобуса и специфичным классам"""
         try:
-            logger.info("Ищем сайт только в элементах с классом _49kxlr...")
+            logger.info("Ищем сайт по SVG иконке глобуса...")
 
-            # Ищем элементы с классом _49kxlr
+            # Ищем SVG с иконкой глобуса (земли)
+            svg_selectors = [
+                'svg[fill="#028eff"]',  # Конкретный цвет из примера
+                'svg',  # Все SVG элементы
+                'div._1iftozu svg'  # SVG внутри div с классом _1iftozu
+            ]
+            
+            for svg_selector in svg_selectors:
+                try:
+                    svg_elements = await self.page.query_selector_all(svg_selector)
+                    
+                    for svg in svg_elements:
+                        try:
+                            # Проверяем, что это иконка глобуса по path
+                            path_element = await svg.query_selector('path')
+                            if path_element:
+                                path_d = await path_element.get_attribute('d')
+                                # Проверяем характерные части path для иконки глобуса
+                                if path_d and any(pattern in path_d for pattern in ['M12 4a8 8', 'a8 8 0', 'A6 6 0']):
+                                    logger.debug("Найдена SVG иконка глобуса")
+                                    
+                                    # Ищем родительский контейнер с сайтом
+                                    current_element = svg
+                                    for level in range(5):  # Проверяем до 5 уровней вверх
+                                        try:
+                                            parent = await current_element.query_selector('xpath=..')
+                                            if not parent:
+                                                break
+                                                
+                                            # Ищем div с классом _49kxlr рядом или внутри
+                                            website_containers = await parent.query_selector_all('div._49kxlr, ._49kxlr')
+                                            
+                                            for container in website_containers:
+                                                # Ищем ссылку внутри контейнера
+                                                links = await container.query_selector_all('a')
+                                                for link in links:
+                                                    # Проверяем href
+                                                    href = await link.get_attribute('href')
+                                                    if href and 'link.2gis.com' in href:
+                                                        # Декодируем 2ГИС ссылку
+                                                        decoded_site = await self.decode_2gis_website_link(href)
+                                                        if decoded_site:
+                                                            logger.info(f"Декодирован сайт: {decoded_site}")
+                                                            return decoded_site
+                                                    
+                                                    # Проверяем текст ссылки (должен быть доменом)
+                                                    link_text = await link.text_content()
+                                                    if link_text:
+                                                        link_text = link_text.strip()
+                                                        logger.debug(f"Найден текст ссылки: {link_text}")
+                                                        
+                                                        # Проверяем, что это домен (включая поддомены)
+                                                        if self.is_valid_domain(link_text):
+                                                            # НЕ убираем поддомены - берем как есть
+                                                            if not link_text.startswith('http'):
+                                                                result = f"https://{link_text}"
+                                                            else:
+                                                                result = link_text
+                                                            logger.info(f"Найден сайт: {result}")
+                                                            return result
+                                            
+                                            current_element = parent
+                                        except:
+                                            break
+                        except:
+                            continue
+                except Exception as e:
+                    logger.debug(f"Ошибка при поиске SVG {svg_selector}: {e}")
+                    continue
+
+            # Если не нашли по SVG, пробуем прямой поиск по классам
+            logger.info("Поиск по SVG не дал результатов, ищем напрямую по классам...")
+            
             try:
-                elements = await self.page.query_selector_all('._49kxlr')
-                logger.debug(f"Найдено элементов с классом _49kxlr: {len(elements)}")
+                # Ищем все элементы с классом _49kxlr
+                website_elements = await self.page.query_selector_all('._49kxlr, div._49kxlr')
+                logger.debug(f"Найдено элементов с классом _49kxlr: {len(website_elements)}")
                 
-                for element in elements:
+                for element in website_elements:
                     try:
-                        # Ищем ссылки внутри элемента
+                        # Ищем ссылки внутри
                         links = await element.query_selector_all('a')
                         for link in links:
-                            # Получаем текст ссылки
-                            link_text = await link.text_content()
-                            if link_text:
-                                link_text = link_text.strip()
-                                logger.debug(f"Найден текст ссылки: {link_text}")
-                                
-                                # Проверяем, что это домен
-                                if re.match(r'^[a-zA-Z0-9][-a-zA-Z0-9]*\.(?:kz|com|ru|org|net|biz|cafe|coffee)$', link_text):
-                                    # Проверяем длину домена
-                                    if len(link_text) > 6:
-                                        result = f"https://{link_text}"
-                                        logger.info(f"Найден сайт в _49kxlr: {result}")
-                                        return result
-                            
-                            # Также проверяем href на случай если там прямая ссылка
+                            # Проверяем href на 2gis ссылку
                             href = await link.get_attribute('href')
                             if href and 'link.2gis.com' in href:
-                                # Попробуем декодировать 2ГИС ссылку
                                 decoded_site = await self.decode_2gis_website_link(href)
                                 if decoded_site:
                                     logger.info(f"Декодирован сайт из _49kxlr: {decoded_site}")
                                     return decoded_site
-                                    
+                            
+                            # Проверяем текст ссылки
+                            link_text = await link.text_content()
+                            if link_text:
+                                link_text = link_text.strip()
+                                
+                                if self.is_valid_domain(link_text):
+                                    if not link_text.startswith('http'):
+                                        result = f"https://{link_text}"
+                                    else:
+                                        result = link_text
+                                    logger.info(f"Найден сайт в _49kxlr: {result}")
+                                    return result
                     except Exception as e:
                         logger.debug(f"Ошибка при обработке элемента _49kxlr: {e}")
                         continue
-                        
             except Exception as e:
-                logger.debug(f"Ошибка при поиске элементов _49kxlr: {e}")
+                logger.debug(f"Ошибка при поиске по классу _49kxlr: {e}")
 
-            # Если не нашли в _49kxlr, пробуем похожие классы
-            try:
-                similar_selectors = [
-                    '[class*="49kxlr"]',
-                    '[class*="kxlr"]',
-                    '[class*="_rehek"]',  # Из вашего примера был класс _1rehek
-                    '[class*="rehek"]'
-                ]
-                
-                for selector in similar_selectors:
-                    try:
-                        elements = await self.page.query_selector_all(selector)
-                        logger.debug(f"Найдено элементов с селектором {selector}: {len(elements)}")
-                        
-                        for element in elements:
-                            links = await element.query_selector_all('a')
-                            for link in links:
-                                link_text = await link.text_content()
-                                if link_text:
-                                    link_text = link_text.strip()
-                                    
-                                    # Строгая проверка на домен
-                                    if re.match(r'^[a-zA-Z0-9][-a-zA-Z0-9]*\.(?:kz|com|ru|org|net)$', link_text):
-                                        if len(link_text) > 6 and '2gis' not in link_text.lower():
-                                            result = f"https://{link_text}"
-                                            logger.info(f"Найден сайт в {selector}: {result}")
-                                            return result
-                                            
-                    except Exception as e:
-                        logger.debug(f"Ошибка при поиске {selector}: {e}")
-                        continue
-                        
-            except Exception as e:
-                logger.debug(f"Ошибка при поиске похожих селекторов: {e}")
-
-            logger.info("Сайт не найден в элементах _49kxlr")
+            logger.info("Сайт не найден")
             return None
-                
+                    
         except Exception as e:
             logger.error(f"Критическая ошибка при поиске сайта: {e}")
             return None
+
+    def is_valid_domain(self, domain: str) -> bool:
+        """Проверка, что строка является валидным доменом (включая поддомены)"""
+        try:
+            if not domain:
+                return False
+                
+            # Убираем протокол если есть
+            domain = domain.replace('https://', '').replace('http://', '')
+            
+            # Убираем путь если есть
+            domain = domain.split('/')[0]
+            
+            # Проверяем базовый паттерн домена (включая поддомены)
+            domain_pattern = r'^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$'
+            
+            if re.match(domain_pattern, domain):
+                # Дополнительные проверки
+                parts = domain.split('.')
+                
+                # Должно быть минимум 2 части (домен.зона)
+                if len(parts) < 2:
+                    return False
+                    
+                # Проверяем зону (последняя часть)
+                tld = parts[-1].lower()
+                valid_tlds = ['com', 'ru', 'kz', 'org', 'net', 'biz', 'info', 'cafe', 'coffee', 'shop', 'store']
+                
+                if tld in valid_tlds:
+                    # Исключаем служебные домены
+                    excluded_domains = ['2gis', 'google', 'yandex', 'facebook', 'vk']
+                    if not any(excluded in domain.lower() for excluded in excluded_domains):
+                        return True
+            
+            return False
+            
+        except:
+            return False
         
     async def decode_2gis_link(self, link: str) -> Optional[str]:
-        """Улучшенное декодирование ссылок 2ГИС"""
+        """Улучшенное декодирование ссылок 2ГИС для WhatsApp"""
         try:
             import base64
             import urllib.parse
@@ -1027,7 +1235,7 @@ class GISParser:
         return None
         
     async def save_to_excel(self, filename: str):
-        """Сохранение результатов в Excel"""
+        """Сохранение результатов в Excel с информацией о дедупликации"""
         try:
             if not self.results:
                 logger.warning("Нет данных для сохранения")
@@ -1036,8 +1244,34 @@ class GISParser:
             df = pd.DataFrame(self.results)
             
             with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+                # Основные данные
                 df.to_excel(writer, sheet_name='Организации', index=False)
                 
+                # Статистика дедупликации
+                stats_data = {
+                    'Метрика': [
+                        'Всего уникальных компаний',
+                        'Всего записей в результате',
+                        'Пропущено дубликатов',
+                        'Категорий обработано',
+                        'Компаний с сайтами',
+                        'Компаний с WhatsApp',
+                        'Компаний с Instagram'
+                    ],
+                    'Значение': [
+                        len(self.processed_companies),
+                        len(self.results),
+                        max(0, len(self.processed_companies) - len(self.results)),
+                        len(set(result['Категория'] for result in self.results)),
+                        len([r for r in self.results if r['Есть сайт'] == 'Да']),
+                        len([r for r in self.results if r['WhatsApp'] != 'Не указано']),
+                        len([r for r in self.results if r['Instagram'] != 'Не указано'])
+                    ]
+                }
+                stats_df = pd.DataFrame(stats_data)
+                stats_df.to_excel(writer, sheet_name='Статистика', index=False)
+                
+                # Форматирование
                 worksheet = writer.sheets['Организации']
                 for column in worksheet.columns:
                     max_length = 0
@@ -1051,16 +1285,30 @@ class GISParser:
                     adjusted_width = min(max_length + 2, 50)
                     worksheet.column_dimensions[column_letter].width = adjusted_width
                     
-            logger.info(f"Данные сохранены в файл: {filename}")
-            logger.info(f"Всего записей: {len(self.results)}")
+            logger.info(f"📊 Данные сохранены в файл: {filename}")
+            logger.info(f"📈 Всего записей: {len(self.results)}")
+            logger.info(f"🔄 Уникальных компаний: {len(self.processed_companies)}")
+            logger.info(f"⏭️ Пропущено дубликатов: {max(0, len(self.processed_companies) - len(self.results))}")
             
         except Exception as e:
             logger.error(f"Ошибка при сохранении в Excel: {e}")
+
+    def get_deduplication_stats(self) -> Dict:
+        """Получение статистики дедупликации"""
+        return {
+            'unique_companies': len(self.processed_companies),
+            'total_records': len(self.results),
+            'duplicates_skipped': max(0, len(self.processed_companies) - len(self.results)),
+            'categories_processed': len(set(result['Категория'] for result in self.results)),
+            'companies_with_websites': len([r for r in self.results if r['Есть сайт'] == 'Да']),
+            'companies_with_whatsapp': len([r for r in self.results if r['WhatsApp'] != 'Не указано']),
+            'companies_with_instagram': len([r for r in self.results if r['Instagram'] != 'Не указано'])
+        }
             
     async def parse_category(self, category: str):
-        """Парсинг одной категории"""
+        """Парсинг одной категории с дедупликацией"""
         try:
-            logger.info(f"Начинаем парсинг категории: {category}")
+            logger.info(f"🎯 Начинаем парсинг категории: {category}")
             
             # Выполняем поиск
             if not await self.open_2gis_and_search(category):
@@ -1070,57 +1318,96 @@ class GISParser:
             business_urls = await self.get_business_links_pagination_fixed()
             
             if not business_urls:
-                logger.warning(f"Не найдено организаций для категории '{category}'")
+                logger.warning(f"❌ Не найдено организаций для категории '{category}'")
                 return
                 
-            logger.info(f"Будем обрабатывать {len(business_urls)} организаций")
+            logger.info(f"🔍 Будем обрабатывать {len(business_urls)} организаций")
             
             # Обрабатываем каждую организацию
             processed = 0
+            skipped = 0
+            
             for i, url in enumerate(business_urls, 1):
                 try:
-                    logger.info(f"Обрабатываем организацию {i}/{len(business_urls)}")
+                    logger.info(f"📋 Обрабатываем организацию {i}/{len(business_urls)}")
                     
                     business_info = await self.extract_business_info(url, category)
                     if business_info:
                         self.results.append(business_info)
                         processed += 1
-                        logger.info(f"Добавлена информация о: {business_info['Название']}")
+                        logger.info(f"✅ Добавлена информация о: {business_info['Название']}")
+                    else:
+                        skipped += 1
+                        logger.info(f"⏭️ Организация пропущена (дубликат или ошибка)")
                     
                     await self.random_delay(2, 4)
                     
                 except Exception as e:
-                    logger.error(f"Ошибка при обработке организации {i}: {e}")
+                    logger.error(f"❌ Ошибка при обработке организации {i}: {e}")
+                    skipped += 1
                     continue
                     
-            logger.info(f"Завершен парсинг категории '{category}'. Собрано {processed} записей")
+            logger.info(f"🎉 Завершен парсинг категории '{category}'")
+            logger.info(f"📊 Обработано: {processed}, Пропущено: {skipped}")
             
         except Exception as e:
-            logger.error(f"Ошибка при парсинге категории '{category}': {e}")
+            logger.error(f"💥 Ошибка при парсинге категории '{category}': {e}")
             
     async def run(self, categories: List[str]):
-        """Основной метод запуска парсера"""
+        """Основной метод запуска парсера с дедупликацией"""
         try:
+            logger.info(f"🚀 Запуск парсера для города: {self.city}")
+            logger.info(f"📝 Категории: {', '.join(categories)}")
+            logger.info(f"🎯 Максимум на категорию: {self.max_items_per_category}")
+            
             await self.setup_browser()
             
-            for category in categories:
+            for i, category in enumerate(categories, 1):
+                logger.info(f"\n{'='*50}")
+                logger.info(f"📂 Категория {i}/{len(categories)}: {category}")
+                logger.info(f"{'='*50}")
+                
                 await self.parse_category(category)
-                await self.random_delay(3, 5)
+                
+                # Показываем промежуточную статистику
+                stats = self.get_deduplication_stats()
+                logger.info(f"📊 Промежуточная статистика:")
+                logger.info(f"   • Уникальных компаний: {stats['unique_companies']}")
+                logger.info(f"   • Записей в результате: {stats['total_records']}")
+                logger.info(f"   • Пропущено дубликатов: {stats['duplicates_skipped']}")
+                
+                if i < len(categories):  # Пауза между категориями
+                    logger.info(f"⏳ Пауза перед следующей категорией...")
+                    await self.random_delay(5, 8)
                 
             # Сохранение результатов
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"2gis_results_{self.city}_{timestamp}.xlsx"
             await self.save_to_excel(filename)
             
+            # Финальная статистика
+            final_stats = self.get_deduplication_stats()
+            logger.info(f"\n🎯 ФИНАЛЬНАЯ СТАТИСТИКА:")
+            logger.info(f"{'='*40}")
+            logger.info(f"📈 Всего уникальных компаний: {final_stats['unique_companies']}")
+            logger.info(f"📋 Записей в результате: {final_stats['total_records']}")
+            logger.info(f"🔄 Пропущено дубликатов: {final_stats['duplicates_skipped']}")
+            logger.info(f"📂 Категорий обработано: {final_stats['categories_processed']}")
+            logger.info(f"🌐 Компаний с сайтами: {final_stats['companies_with_websites']}")
+            logger.info(f"📱 Компаний с WhatsApp: {final_stats['companies_with_whatsapp']}")
+            logger.info(f"📸 Компаний с Instagram: {final_stats['companies_with_instagram']}")
+            logger.info(f"💾 Файл сохранен: {filename}")
+            logger.info(f"{'='*40}")
+            
         except Exception as e:
-            logger.error(f"Критическая ошибка: {e}")
+            logger.error(f"💥 Критическая ошибка: {e}")
             raise
             
         finally:
             if self.browser:
                 try:
                     await self.browser.close()
-                    logger.info("Браузер закрыт")
+                    logger.info("🔒 Браузер закрыт")
                 except:
                     pass
             if hasattr(self, 'playwright'):
@@ -1130,18 +1417,38 @@ class GISParser:
                     pass
 
 def main():
-    """Главная функция"""
-    parser = argparse.ArgumentParser(description='Улучшенный парсер 2ГИС с пагинацией')
-    parser.add_argument('--city', '-c', default='Астана', help='Город для поиска')
+    """Главная функция с улучшенной обработкой аргументов"""
+    parser = argparse.ArgumentParser(
+        description='Улучшенный парсер 2ГИС с дедупликацией и исправленным извлечением сайтов',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Примеры использования:
+  python improved_2gis_parser.py --city "Астана" --categories "кофейни" "салоны красоты" --max-items 50
+  python improved_2gis_parser.py --config config.json
+  python improved_2gis_parser.py --categories "стоматологии" "фитнес-центры" "рестораны"
+        """
+    )
+    
+    parser.add_argument('--city', '-c', default='Астана', 
+                       help='Город для поиска (по умолчанию: Астана)')
     parser.add_argument('--categories', '-cat', nargs='+', 
                        default=['кофейни'],
-                       help='Список категорий для парсинга')
+                       help='Список категорий для парсинга (по умолчанию: кофейни)')
     parser.add_argument('--max-items', '-m', type=int, default=100,
-                       help='Максимальное количество организаций на категорию')
-    parser.add_argument('--config', help='Путь к JSON файлу с конфигурацией')
+                       help='Максимальное количество организаций на категорию (по умолчанию: 100)')
+    parser.add_argument('--config', '-cfg', 
+                       help='Путь к JSON файлу с конфигурацией')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                       help='Подробный вывод (DEBUG уровень логирования)')
     
     args = parser.parse_args()
     
+    # Настройка уровня логирования
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.info("🔍 Включен подробный режим логирования")
+    
+    # Загрузка конфигурации из файла
     if args.config:
         try:
             with open(args.config, 'r', encoding='utf-8') as f:
@@ -1149,16 +1456,40 @@ def main():
                 args.city = config.get('city', args.city)
                 args.categories = config.get('categories', args.categories)
                 args.max_items = config.get('max_items', args.max_items)
+                logger.info(f"📄 Конфигурация загружена из {args.config}")
         except Exception as e:
-            logger.error(f"Ошибка при загрузке конфигурации: {e}")
+            logger.error(f"❌ Ошибка при загрузке конфигурации: {e}")
+            return
     
-    parser_instance = GISParser(city=args.city, max_items_per_category=args.max_items)
+    # Валидация аргументов
+    if args.max_items <= 0:
+        logger.error("❌ Максимальное количество элементов должно быть больше 0")
+        return
+        
+    if not args.categories:
+        logger.error("❌ Необходимо указать хотя бы одну категорию")
+        return
+    
+    # Создание и запуск парсера
+    logger.info(f"🎯 Инициализация парсера...")
+    parser_instance = GISParser(
+        city=args.city, 
+        max_items_per_category=args.max_items
+    )
     
     try:
+        logger.info(f"▶️ Запуск парсинга...")
         asyncio.run(parser_instance.run(args.categories))
-        logger.info("Парсинг завершен успешно!")
+        logger.info("🎉 Парсинг завершен успешно!")
+        
+    except KeyboardInterrupt:
+        logger.info("⏹️ Парсинг прерван пользователем")
+        
     except Exception as e:
-        logger.error(f"Парсинг завершен с ошибкой: {e}")
+        logger.error(f"💥 Парсинг завершен с ошибкой: {e}")
+        return 1
+        
+    return 0
 
 if __name__ == "__main__":
-    main()
+    exit(main())
